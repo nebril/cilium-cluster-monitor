@@ -1,4 +1,5 @@
 import time
+import json
 import signal
 import argparse
 import sys
@@ -12,6 +13,7 @@ from kubernetes.client import Configuration
 from kubernetes.client.apis import core_v1_api
 from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
+
 import urwid
 import urwid.raw_display
 
@@ -51,8 +53,7 @@ def connect_monitor(m: Monitor):
             print('Unknown error: %s' % e)
             exit(1)
 
-
-# calling exec and wait for response.
+    # calling exec and wait for response.
     exec_command = [
         'cilium',
         'monitor']
@@ -90,8 +91,8 @@ def connect_monitor(m: Monitor):
     m.queue.cancel_join_thread()
 
 
-def run_monitors(endpoint: int, verbose: bool, queue: Queue,
-                 close_queue: Queue) -> List[Monitor]:
+def run_monitors(endpoint: int, verbose: bool, selectors: List[str],
+                 queue: Queue, close_queue: Queue) -> List[Monitor]:
 
     try:
         config.load_kube_config()
@@ -101,6 +102,7 @@ def run_monitors(endpoint: int, verbose: bool, queue: Queue,
     c = Configuration()
     c.assert_hostname = False
     Configuration.set_default(c)
+    # TODO: move these two to new Monitors class
     api = core_v1_api.CoreV1Api()
     namespace = 'kube-system'
 
@@ -112,6 +114,9 @@ def run_monitors(endpoint: int, verbose: bool, queue: Queue,
         sys.exit(1)
 
     names = [pod.metadata.name for pod in pods.items]
+
+    endpoints = retrieve_endpoint_ids(api, selectors, names)
+    print(endpoints)
 
     monitors = [
         Monitor(name, namespace, queue, close_queue, api, endpoint, verbose)
@@ -130,7 +135,34 @@ def close_monitors(close_queue: Queue, monitors: List[Monitor]):
         m.process.join()
 
 
-def ui(monitors):
+def retrieve_endpoint_ids(api: core_v1_api.CoreV1Api, selectors: List[str],
+                          node_names: List[str]) -> List[int]:
+    ids = []
+    for node in node_names:
+        exec_command = ['cilium', 'endpoint', 'list', '-o', 'json']
+        resp = stream(api.connect_get_namespaced_pod_exec, node, 'kube-system',
+                      command=exec_command,
+                      stderr=False, stdin=False,
+                      stdout=True, tty=False, _preload_content=False,
+                      _return_http_data_only=True)
+        output = ""
+        while resp.is_open():
+            resp.update(timeout=1)
+            if resp.peek_stdout():
+                output += resp.read_stdout()
+            try:
+                data = json.loads(output)
+                resp.close()
+            except ValueError:
+                continue
+
+        #check labels here
+        filtered = [endpoint for endpoint in data if any(endpoint['labels']['orchestration-identity'])]
+
+    return []
+
+
+def ui(monitors: List[Monitor]):
     monitor_columns = {m.pod_name: (urwid.Text(m.output), m)
                        for m in monitors}
 
@@ -212,13 +244,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--endpoint', type=int, help='endpoint id', default=0)
     parser.add_argument('--verbose', type=bool, default=False)
+    parser.add_argument('--selectors', action='append',
+                        help='k8s equality label selectors for pods which '
+                        'monitor should listen to. each selector will '
+                        'retrieve its own set of pods')
     args = parser.parse_args()
 
     q = Queue()
     close_queue = Queue()
-    monitors = run_monitors(args.endpoint, args.verbose, q, close_queue)
+    monitors = run_monitors(args.endpoint, args.verbose, args.selectors,
+                            q, close_queue)
 
-    ui(monitors)
+    # ui(monitors)
     close_monitors(close_queue, monitors)
 
 
